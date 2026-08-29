@@ -1,0 +1,9 @@
+# 個人環境・プライベートデータ（絶対にコミットしない）
+CLAUDE.md
+accounts.json
+image_cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
