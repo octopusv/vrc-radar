@@ -11,6 +11,11 @@ const ACCT = (() => {
   return m ? +m[1] : 1;
 })();
 
+// /dev: same SPA, but every API answer comes from the fictional dataset in
+// demo-data.js (loaded in boot()) — for showing the app without real friends
+const DEMO = /^\/dev\/?$/.test(location.pathname);
+let demoApi = null;
+
 const KINDS = {
   gps: { label: '移動', color: '#3987e5' },
   online: { label: 'オンライン', color: '#d95926' },
@@ -50,14 +55,18 @@ function currentRoute() {
   return () => token === state.routeToken;
 }
 
+// demo mode keeps its own prefs so playing with /dev filters never
+// touches the real page's saved state
+const PREF_NS = DEMO ? 'vrcradar.demo.' : 'vrcradar.';
+
 function loadPref(key, fallback) {
   try {
-    const v = JSON.parse(localStorage.getItem('vrcradar.' + key));
+    const v = JSON.parse(localStorage.getItem(PREF_NS + key));
     return v == null ? fallback : v;
   } catch (e) { return fallback; }
 }
 function savePref(key, value) {
-  try { localStorage.setItem('vrcradar.' + key, JSON.stringify(value)); }
+  try { localStorage.setItem(PREF_NS + key, JSON.stringify(value)); }
   catch (e) { /* ignore */ }
 }
 
@@ -79,6 +88,7 @@ function buildUrl(path, params) {
 }
 
 async function api(path, params) {
+  if (DEMO) return demoApi(path, params || {});
   const res = await fetch(buildUrl(path, params));
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
@@ -186,14 +196,17 @@ function statusColor(status) {
   return (STATUS[status] || { color: '#51e57e' }).color;
 }
 
-// image refs from the API are /api/image?fid=…&v=… paths; add the account
+// image refs from the API are /api/image?fid=…&v=… paths; add the account.
+// demo mode hands out self-contained data: URIs that pass through as-is.
 function imgUrl(ref) {
-  return ref ? `${ref}&acct=${ACCT}` : '';
+  if (!ref) return '';
+  return ref.startsWith('data:') ? ref : `${ref}&acct=${ACCT}`;
 }
 
 // high-resolution variant of the same image, for the lightbox
 function imgUrlFull(ref) {
-  return ref ? `${ref}&s=1024&acct=${ACCT}` : '';
+  if (!ref) return '';
+  return ref.startsWith('data:') ? ref : `${ref}&s=1024&acct=${ACCT}`;
 }
 
 // small round profile picture with an initial fallback and an optional
@@ -522,7 +535,7 @@ function renderHBars(container, rows) {
   const rowH = 26;
   const H = rows.length * rowH + 6;
   const labelW = Math.min(150, W * 0.32);
-  const valueW = 48;
+  const valueW = Math.min(96, 12 + 7 * Math.max(...rows.map(r => String(r.valueLabel).length)));
   const iw = W - labelW - valueW - 10;
   const maxV = Math.max(1, ...rows.map(r => r.value));
   let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" height="${H}">`;
@@ -541,7 +554,7 @@ function renderHBars(container, rows) {
     const t = e.target.closest('[data-i]');
     if (!t) { hideTooltip(); return; }
     const r = rows[+t.dataset.i];
-    showTooltip(`<div class="t-title">${esc(r.label)}</div><div class="t-row">${esc(r.valueLabel)}</div>`, e.clientX, e.clientY);
+    showTooltip(`<div class="t-title">${esc(r.label)}</div><div class="t-row">${esc(r.valueLabel)}</div>${r.tip ? `<div class="t-row">${esc(r.tip)}</div>` : ''}`, e.clientX, e.clientY);
   });
   el.addEventListener('mouseleave', hideTooltip);
   el.addEventListener('click', (e) => {
@@ -663,9 +676,9 @@ async function pageDashboard() {
         <div class="table-scroll scroll-y"><table class="list"><tbody id="online-list"></tbody></table></div>
       </div>
       <div class="card">
-        <h2>一緒にいた時間が長いフレンド <span class="muted">(7日)</span></h2>
+        <h2>一緒にいた時間が長いフレンド <span class="muted" id="tf-range">(7日)</span></h2>
         <div id="top-friends"></div>
-        <div class="muted" style="font-size:11px;margin-top:8px">VRCXが記録したオンラインセッション時間の合計</div>
+        <div class="muted" style="font-size:11px;margin-top:8px">自分と同じインスタンスに居た時間（退室時刻が残らないため目安）・×は会った回数</div>
       </div>
     </div>`;
 
@@ -695,11 +708,14 @@ async function pageDashboard() {
   let actData = act, actDays = 7;
   const drawActivity = () => {
     renderStackedBars($('#act-chart'), buildBuckets(actData.series, actDays), KIND_ORDER);
+    $('#tf-range').textContent = actDays === 1 ? '(24時間)' : `(${actDays}日)`;
     const rows = actData.top_friends.map(t => ({
-      label: t.display_name, value: t.ms, valueLabel: fmtHours(t.ms), user_id: t.user_id,
+      label: t.display_name, value: t.ms, user_id: t.user_id,
+      valueLabel: fmtHours(t.ms) + (t.meets ? ` ×${t.meets}` : ''),
+      tip: (t.worlds || []).join('、'),
     }));
     if (rows.length) renderHBars($('#top-friends'), rows);
-    else $('#top-friends').innerHTML = '<div class="center">データがまだありません</div>';
+    else $('#top-friends').innerHTML = '<div class="center">この期間に一緒にいた記録がありません</div>';
   };
   drawActivity();
   onResize(drawActivity);
@@ -1396,10 +1412,6 @@ async function refreshFreshness() {
     el.innerHTML = '<span class="dot"></span>サーバーに接続できません';
   }
 }
-setInterval(refreshFreshness, 60e3);
-refreshFreshness();
-initAccounts();
-
 /* ---------------- router ---------------- */
 
 const routes = {
@@ -1422,5 +1434,30 @@ function route() {
   window.scrollTo(0, 0);
 }
 
-addEventListener('hashchange', route);
-route();
+/* ---------------- boot ---------------- */
+
+async function boot() {
+  // a home-screen icon must reopen the page it was added from: point the
+  // manifest's start_url at this variant (/dev demo, /2 second account, …)
+  const start = DEMO ? '/dev' : ACCT > 1 ? `/${ACCT}` : '';
+  if (start) {
+    $('link[rel="manifest"]').href =
+      `/manifest.webmanifest?start=${encodeURIComponent(start)}`;
+  }
+  if (DEMO) {
+    ({ demoApi } = await import('/demo-data.js'));
+    // iOS prefers this meta over the manifest name for the icon label
+    $('meta[name="apple-mobile-web-app-title"]')
+      .setAttribute('content', 'VRC Radar デモ');
+    $('.brand > span').insertAdjacentHTML('afterend',
+      '<span class="demo-pill">DEMO</span>');
+    document.body.insertAdjacentHTML('afterbegin',
+      '<div class="demo-banner">デモページ — 表示されているユーザー・データはすべて架空のものです</div>');
+  }
+  setInterval(refreshFreshness, 60e3);
+  refreshFreshness();
+  initAccounts();
+  addEventListener('hashchange', route);
+  route();
+}
+boot();

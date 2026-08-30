@@ -489,6 +489,27 @@ svg.chart text { font-family: inherit; }
   white-space: nowrap;
 }
 
+/* demo mode (/dev) */
+.demo-banner {
+  background: rgba(57, 135, 229, 0.14);
+  border-bottom: 1px solid rgba(57, 135, 229, 0.35);
+  color: #9ec7f2;
+  font-size: 12px;
+  text-align: center;
+  padding: 6px calc(10px + env(safe-area-inset-right))
+           6px calc(10px + env(safe-area-inset-left));
+}
+.demo-pill {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  border: 1px solid rgba(57, 135, 229, 0.5);
+  border-radius: 999px;
+  padding: 1px 7px;
+  flex: 0 0 auto;
+}
+
 /* fav status banner */
 .fav-warn {
   background: rgba(230, 168, 0, 0.10);

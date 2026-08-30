@@ -31,6 +31,7 @@ import urllib.error
 import urllib.request
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -702,6 +703,15 @@ def iso_from_epoch(ts):
         "%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def iso_to_ms(s):
+    try:
+        return int(
+            datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000
+        )
+    except (ValueError, AttributeError):
+        return 0
+
+
 def iso_ago(**kw):
     return (datetime.now(timezone.utc) - timedelta(**kw)).strftime(
         "%Y-%m-%dT%H:%M:%S.000Z"
@@ -1266,15 +1276,34 @@ def api_user(conn, prefix, params, account):
         d["image"] = image_ref(d.pop("thumb"))
         avatars.append(d)
 
-    cutoff_ms = int(
-        (datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000
-    )
-    sessions = conn.execute(
-        f"SELECT start_at, end_at, is_open_tail"
-        f" FROM {prefix}_activity_sessions_v2"
-        f" WHERE user_id = ? AND end_at >= ? ORDER BY start_at",
-        (uid, cutoff_ms),
+    # オンラインセッションは _feed_online_offline の Online→Offline ペアで
+    # 復元する（VRCXのactivity_sessionsと同じ組み立て。Offline行の time 列は
+    # 「最後に居た場所の滞在時間」であってセッション長ではない）。対になる
+    # Offlineが無いまま次のOnlineが来た区間は捨てる（VRCX停止中のログアウトを
+    # 跨いで過大計上しないため）。最終行がOnlineなら進行中とみなすが、
+    # 24時間より古いものはstaleとして切り捨てる
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    live_rows = conn.execute(
+        f"SELECT created_at, type FROM {prefix}_feed_online_offline"
+        f" WHERE user_id = ? AND created_at >= ? ORDER BY created_at",
+        (uid, iso_ago(days=30)),
     ).fetchall()
+    sessions = []
+    pending = None
+    for r in live_rows:
+        if r["type"] == "Online":
+            pending = iso_to_ms(r["created_at"])
+        elif r["type"] == "Offline" and pending:
+            end_ms = iso_to_ms(r["created_at"])
+            if end_ms > pending:
+                sessions.append(
+                    {"start_at": pending, "end_at": end_ms, "is_open_tail": 0}
+                )
+            pending = None
+    if pending and now_ms - pending <= 86400_000:
+        sessions.append(
+            {"start_at": pending, "end_at": now_ms, "is_open_tail": 1}
+        )
 
     return {
         "profile": profile,
@@ -1374,6 +1403,85 @@ def api_notifications(conn, prefix, params, account):
     return {"items": items, "next": next_cursor}
 
 
+# 自分の1インスタンス滞在の上限。gamelog_location に退室時刻が無いため、
+# 「次の自分の移動」が来ないままの滞在はこの長さで打ち切る（イベント会場の
+# グループインスタンスが自分の退出後も何日も生き続けて過大計上されるのを防ぐ）
+TOGETHER_STAY_CAP_MS = 6 * 3600_000
+
+
+def time_together(conn, prefix, cutoff_ms, now_ms):
+    """「一緒にいた時間」: 自分が居たインスタンス(gamelog_location)と、フレンドの
+    居場所遷移(_feed_gps)の重なりを、インスタンス文字列の完全一致で突き合わせる。
+    インスタンスIDは作成ごとにほぼ一意なので文字列一致=同じ集まり。
+    自分の退室時刻は記録されないため、次の自分の移動・STAY_CAP・現在時刻で
+    クリップした近似になる（時間は目安、visits の数は正確）。
+
+    {uid: {"ms": 重なり合計, "visits": 会った自分の滞在の集合,
+           "worlds": [ワールド名…]}}
+    """
+    margin_iso = iso_from_epoch((cutoff_ms - TOGETHER_STAY_CAP_MS) / 1000)
+    own_rows = conn.execute(
+        "SELECT created_at, location, world_name, time FROM gamelog_location"
+        " WHERE created_at >= ? AND location != '' ORDER BY created_at",
+        (margin_iso,),
+    ).fetchall()
+    own_by_loc = {}
+    for i, r in enumerate(own_rows):
+        start = iso_to_ms(r["created_at"])
+        end = min(start + TOGETHER_STAY_CAP_MS, now_ms)
+        if i + 1 < len(own_rows):
+            end = min(end, iso_to_ms(own_rows[i + 1]["created_at"]))
+        if r["time"]:  # 古いVRCXは滞在時間を書く。あれば一番良い境界
+            end = min(end, start + r["time"])
+        if end > start:
+            own_by_loc.setdefault(r["location"], []).append(
+                (start, end, r["world_name"])
+            )
+    if not own_by_loc:
+        return {}
+
+    # フレンド側: gps行=そのlocationに入った時刻。online/offline行が来たら
+    # 居場所不明に戻す。隣接イベントで区切った区間がそのlocationでの滞在
+    events = {}
+    for r in conn.execute(
+        f"SELECT created_at, user_id, location FROM {prefix}_feed_gps"
+        f" WHERE created_at >= ?",
+        (margin_iso,),
+    ):
+        events.setdefault(r["user_id"], []).append(
+            (iso_to_ms(r["created_at"]), r["location"])
+        )
+    for r in conn.execute(
+        f"SELECT created_at, user_id FROM {prefix}_feed_online_offline"
+        f" WHERE created_at >= ?",
+        (margin_iso,),
+    ):
+        events.setdefault(r["user_id"], []).append(
+            (iso_to_ms(r["created_at"]), "")
+        )
+
+    out = {}
+    for uid, evs in events.items():
+        evs.sort()
+        for i, (entered, loc) in enumerate(evs):
+            stays = own_by_loc.get(loc)
+            if not stays:
+                continue
+            left = evs[i + 1][0] if i + 1 < len(evs) else now_ms
+            for start, end, world_name in stays:
+                lo = max(entered, start, cutoff_ms)
+                hi = min(left, end)
+                if hi <= lo:
+                    continue
+                d = out.setdefault(
+                    uid, {"ms": 0, "visits": set(), "worlds": []})
+                d["ms"] += hi - lo
+                d["visits"].add((start, loc))
+                if world_name and world_name not in d["worlds"]:
+                    d["worlds"].append(world_name)
+    return out
+
+
 def api_activity(conn, prefix, params, account):
     days = int(params.get("days", "7"))
     if days not in (1, 7, 30):
@@ -1392,27 +1500,20 @@ def api_activity(conn, prefix, params, account):
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     cutoff_ms = now_ms - days * 86400_000
-    totals = {}
-    for r in conn.execute(
-        f"SELECT user_id, start_at, end_at, is_open_tail"
-        f" FROM {prefix}_activity_sessions_v2 WHERE end_at >= ?"
-        f" OR is_open_tail = 1",
-        (cutoff_ms,),
-    ):
-        end = now_ms if r["is_open_tail"] else min(r["end_at"], now_ms)
-        start = max(r["start_at"], cutoff_ms)
-        if end > start:
-            totals[r["user_id"]] = totals.get(r["user_id"], 0) + (end - start)
+    together = time_together(conn, prefix, cutoff_ms, now_ms)
     friends_map = {
         r["user_id"]: r["display_name"]
         for r in conn.execute(
             f"SELECT user_id, display_name FROM {prefix}_friend_log_current"
         )
     }
-    top = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:15]
+    top = sorted(
+        together.items(), key=lambda kv: kv[1]["ms"], reverse=True
+    )[:15]
     top_friends = [
-        {"user_id": uid, "display_name": friends_map.get(uid, uid), "ms": ms}
-        for uid, ms in top
+        {"user_id": uid, "display_name": friends_map.get(uid, uid),
+         "ms": d["ms"], "meets": len(d["visits"]), "worlds": d["worlds"][:3]}
+        for uid, d in top
     ]
     return {
         "days": days,
@@ -1490,6 +1591,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json(200, {"ok": True})
             return
+        if path == "/manifest.webmanifest":
+            params = {k: v[0] for k, v in parse_qs(parsed.query).items() if v}
+            self.serve_manifest(params)
+            return
         if path == "/api/image":
             params = {k: v[0] for k, v in parse_qs(parsed.query).items() if v}
             self.run_image(params)
@@ -1541,6 +1646,33 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def serve_manifest(self, params):
+        """PWA manifest with start_url scoped to the page it was linked
+        from (?start=/dev or /2, set by app.js). Without this, an icon
+        added to the home screen from /dev or /2 would always reopen "/"
+        — the first account's real data."""
+        start = params.get("start", "/")
+        if not re.fullmatch(r"/(?:dev|[1-9]\d{0,2})", start):
+            start = "/"
+        try:
+            manifest = json.loads(
+                (STATIC_DIR / "manifest.webmanifest").read_text("utf-8"))
+        except (OSError, ValueError):
+            self.send_json(404, {"error": "not found"})
+            return
+        manifest["start_url"] = start
+        if start == "/dev":
+            manifest["name"] = "VRC Radar デモ"
+            manifest["short_name"] = "VRC Radar デモ"
+        body = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header(
+            "Content-Type", "application/manifest+json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
     def serve_static(self, path):
         if path in ("/", ""):
             path = "/index.html"
@@ -1551,6 +1683,19 @@ class Handler(BaseHTTPRequestHandler):
             if not target.is_file():
                 self.send_json(404, {"error": "not found"})
                 return
+        # no-cache means "revalidate", but without a validator browsers may
+        # keep serving a stale app.js from disk cache; Last-Modified + 304
+        # makes the revalidation actually work
+        try:
+            last_mod = formatdate(target.stat().st_mtime, usegmt=True)
+        except OSError:
+            last_mod = ""
+        if last_mod and self.headers.get("If-Modified-Since") == last_mod:
+            self.send_response(304)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Last-Modified", last_mod)
+            self.end_headers()
+            return
         body = target.read_bytes()
         ctype = CONTENT_TYPES.get(
             target.suffix.lower(), "application/octet-stream")
@@ -1558,6 +1703,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
+        if last_mod:
+            self.send_header("Last-Modified", last_mod)
         self.end_headers()
         self.wfile.write(body)
 
