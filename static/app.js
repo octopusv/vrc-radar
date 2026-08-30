@@ -1100,13 +1100,13 @@ async function pageGraph() {
     <h1>フレンド相関グラフ</h1>
     <div class="chips">
       <input type="search" id="g-q" placeholder="名前で検索してハイライト">
-      <span class="legend">${Object.entries(TRUST).map(([k, t]) =>
-        `<span class="item"><span class="sw" style="background:${t.color};border-radius:50%"></span>${t.label}</span>`).join('')}
+      <span class="legend">
         <span class="item"><span class="sw" style="background:transparent;border:1.5px solid #eda100;border-radius:50%"></span>★お気に入り</span>
+        <span id="g-comm"></span>
       </span>
     </div>
     <div id="graph-wrap"><canvas id="graph-canvas"></canvas></div>
-    <div class="graph-hint">相互フレンド関係をリンクで表示。ドラッグで移動、ホイール/ピンチでズーム、ノードタップで詳細へ。</div>`;
+    <div class="graph-hint">フレンド同士の相互リンクを表示（自分は含まない）。色は相互リンクのまとまり（界隈）ごと、相互の多い人ほど大きく・中心寄り。つながりが確認できていない人は線なしで外周へ。ドラッグでパン、ホイール/ピンチでズーム、ノードタップで詳細へ。</div>`;
 
   let data;
   try { data = await api('/api/graph'); }
@@ -1129,25 +1129,174 @@ async function pageGraph() {
   const ctx = canvas.getContext('2d');
 
   const nodes = data.nodes.map((n, i) => ({ ...n, i }));
-  const links = data.links.map(([a, b]) => ({ source: a, target: b }));
+  const maxDeg = Math.max(1, ...nodes.map(n => n.deg || 0));
+  const N = nodes.length;
+
   const neighbors = new Map();
   for (const l of data.links) {
     (neighbors.get(l[0]) || neighbors.set(l[0], new Set()).get(l[0])).add(l[1]);
     (neighbors.get(l[1]) || neighbors.set(l[1], new Set()).get(l[1])).add(l[0]);
   }
+  const links = data.links.map(([a, b]) => ({ source: a, target: b }));
 
-  const radius = n => 3 + Math.sqrt(n.deg || 0) * 0.9;
+  // ---- 界隈（コミュニティ）検出: Louvain法の局所移動フェーズのみの簡易版。
+  // 相互リンクの密なまとまりを見つけて色分けに使う（VRCX風）
+  const commOf = Array.from({ length: N }, (_, i) => i);
+  {
+    const degArr = Array.from({ length: N },
+      (_, i) => (neighbors.get(i) || { size: 0 }).size);
+    const sumTot = degArr.slice();
+    const m2 = 2 * links.length || 1;
+    for (let pass = 0; pass < 10; pass++) {
+      let moved = 0;
+      for (let i = 0; i < N; i++) {
+        const ns = neighbors.get(i);
+        if (!ns || !ns.size) continue;
+        const own = commOf[i];
+        sumTot[own] -= degArr[i];
+        const eTo = new Map();
+        for (const j of ns) eTo.set(commOf[j], (eTo.get(commOf[j]) || 0) + 1);
+        let best = own;
+        let bestGain = (eTo.get(own) || 0) - sumTot[own] * degArr[i] / m2;
+        for (const [c, e] of eTo) {
+          if (c === own) continue;
+          const gain = e - sumTot[c] * degArr[i] / m2;
+          if (gain > bestGain + 1e-9) { best = c; bestGain = gain; }
+        }
+        sumTot[best] += degArr[i];
+        if (best !== own) { commOf[i] = best; moved++; }
+      }
+      if (!moved) break;
+    }
+  }
+  // 色はVRCX(ECharts既定)と同じパレットを、界隈の大きい順に循環割当。
+  // 孤立した人も自分だけの界隈として色が付く（外周のカラフルな粒になる）
+  const COMM_COLORS = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de',
+    '#3ba272', '#fc8452', '#9a60b4', '#ea7ccc'];
+  const commSize = new Map();
+  for (let i = 0; i < N; i++) {
+    commSize.set(commOf[i], (commSize.get(commOf[i]) || 0) + 1);
+  }
+  const ranked = [...commSize].sort((a, b) => b[1] - a[1]);
+  const commColor = new Map(
+    ranked.map(([c], i) => [c, COMM_COLORS[i % COMM_COLORS.length]]));
+  for (const n of nodes) n.color = commColor.get(commOf[n.i]);
+  $('#g-comm').innerHTML = ranked.filter(([, s]) => s >= 3)
+    .slice(0, COMM_COLORS.length).map(([c, s]) =>
+      `<span class="item"><span class="sw" style="background:${commColor.get(c)};border-radius:50%"></span>${s}人</span>`).join('');
+
+  // ノードの大きさはVRCXと同一: 4〜22px の線形スケール
+  const radius = n => 4 + ((n.deg || 0) / maxDeg) * 18;
+
+  // ---- レイアウト: VRCXの相関グラフと同じ ForceAtlas2 → Noverlap。
+  // graphology-layout-forceatlas2 / -noverlap の式を移植（Barnes-Hut無しの
+  // 全ペア計算。数百ノードなら十分速い）。パラメータもVRCXの既定値
+  // （spacing=60, iterations=800, slowDown=2, strongGravity）に合わせる
+  {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#8a8894';
+    ctx.textAlign = 'center';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillText('レイアウト計算中…', W / 2, H / 2);
+
+    let seed = 1234567;
+    const rand = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+    const X = new Float64Array(N), Y = new Float64Array(N);
+    const DX = new Float64Array(N), DY = new Float64Array(N);
+    const ODX = new Float64Array(N), ODY = new Float64Array(N);
+    const MASS = new Float64Array(N);
+    const CONV = new Float64Array(N).fill(1);
+    const initR = Math.max(50, Math.sqrt(N) * 30);
+    for (let i = 0; i < N; i++) {
+      const a = rand() * 2 * Math.PI;
+      const r = Math.sqrt(rand()) * initR;
+      X[i] = Math.cos(a) * r;
+      Y[i] = Math.sin(a) * r;
+      MASS[i] = 1 + (nodes[i].deg || 0);
+    }
+    const T = (60 - 8) / (240 - 8);           // VRCXのspacingスライダー既定値60
+    const SCALING = 60;
+    const GRAVITY = 1.6 + (0.6 - 1.6) * T;
+    const SLOW = 2;
+    const step = () => {
+      for (let i = 0; i < N; i++) { ODX[i] = DX[i]; ODY[i] = DY[i]; DX[i] = 0; DY[i] = 0; }
+      // 斥力: 次数比例の質量同士・距離に反比例
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j < i; j++) {
+          const xd = X[i] - X[j], yd = Y[i] - Y[j];
+          const d2 = xd * xd + yd * yd;
+          if (d2 > 0) {
+            const f = SCALING * MASS[i] * MASS[j] / d2;
+            DX[i] += xd * f; DY[i] += yd * f;
+            DX[j] -= xd * f; DY[j] -= yd * f;
+          }
+        }
+      }
+      // 強重力（中心からの距離に比例）
+      for (let i = 0; i < N; i++) {
+        DX[i] -= X[i] * MASS[i] * GRAVITY;
+        DY[i] -= Y[i] * MASS[i] * GRAVITY;
+      }
+      // エッジの引力（距離に線形）
+      for (const l of links) {
+        const xd = X[l.source] - X[l.target], yd = Y[l.source] - Y[l.target];
+        DX[l.source] -= xd; DY[l.source] -= yd;
+        DX[l.target] += xd; DY[l.target] += yd;
+      }
+      // 揺れ(swinging)に応じた適応速度で位置を更新
+      for (let i = 0; i < N; i++) {
+        const sw = MASS[i] * Math.hypot(ODX[i] - DX[i], ODY[i] - DY[i]);
+        const tr = Math.hypot(ODX[i] + DX[i], ODY[i] + DY[i]) / 2;
+        const sp = CONV[i] * Math.log(1 + tr) / (1 + Math.sqrt(sw));
+        CONV[i] = Math.min(1,
+          Math.sqrt(sp * (DX[i] * DX[i] + DY[i] * DY[i]) / (1 + Math.sqrt(sw))));
+        X[i] += DX[i] * (sp / SLOW);
+        Y[i] += DY[i] * (sp / SLOW);
+      }
+    };
+    for (let it = 0; it < 800; it++) {
+      step();
+      if (it % 80 === 79) {                   // UIを固めないよう小刻みに譲る
+        await new Promise(r => setTimeout(r));
+        if (!alive()) return;
+      }
+    }
+    // Noverlap: 重なっているペアだけを少しずつ押し離す（collideのように
+    // 詰め込まないので蜂の巣状に密着しない）
+    const RATIO = 1.05 + (1.35 - 1.05) * T;
+    const MARGIN = 1 + (8 - 1) * T;
+    for (let it = 0; it < 200; it++) {
+      let moved = false;
+      DX.fill(0); DY.fill(0);
+      for (let i = 0; i < N; i++) {
+        const r1 = radius(nodes[i]);
+        const s1 = r1 * RATIO + MARGIN;
+        for (let j = i + 1; j < N; j++) {
+          const xd = X[j] - X[i], yd = Y[j] - Y[i];
+          const dist = Math.hypot(xd, yd);
+          if (dist >= s1 + radius(nodes[j]) * RATIO + MARGIN) continue;
+          moved = true;
+          if (dist > 0) {
+            DX[j] += (xd / dist) * (1 + r1);
+            DY[j] += (yd / dist) * (1 + r1);
+          } else {
+            DX[j] += rand() - 0.5; DY[j] += rand() - 0.5;
+          }
+        }
+      }
+      if (!moved) break;
+      for (let i = 0; i < N; i++) { X[i] += DX[i] * 0.3; Y[i] += DY[i] * 0.3; }
+    }
+    for (let i = 0; i < N; i++) { nodes[i].x = X[i]; nodes[i].y = Y[i]; }
+  }
+  if (!alive()) return;
+
+  // ラベル候補は相互リンク数の多い順（重なったら下位を間引く）
+  const labelOrder = nodes.slice().sort((a, b) => (b.deg || 0) - (a.deg || 0));
+
   let transform = d3.zoomIdentity;
   let hover = null;
   let highlight = null;
-
-  const sim = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).distance(38).strength(0.25))
-    .force('charge', d3.forceManyBody().strength(-42).theta(0.95))
-    .force('center', d3.forceCenter(W / 2, H / 2))
-    .force('collide', d3.forceCollide().radius(n => radius(n) + 2))
-    .velocityDecay(0.32);
-  onCleanup(() => sim.stop());
 
   const draw = () => {
     ctx.save();
@@ -1155,52 +1304,127 @@ async function pageGraph() {
     ctx.clearRect(0, 0, W, H);
     ctx.translate(transform.x, transform.y);
     ctx.scale(transform.k, transform.k);
+    const k = transform.k;
 
-    const focus = hover != null ? new Set([hover.i, ...(neighbors.get(hover.i) || [])]) : null;
+    const focus = hover
+      ? new Set([hover.i, ...(neighbors.get(hover.i) || [])]) : null;
 
-    ctx.lineWidth = 0.6 / transform.k;
+    // エッジ: VRCXと同じ #334155 の細いカーブ（曲率0.1）。
+    // ホバー中は本人につながる分だけ明るく描き、他は非表示
+    const curve = (a, b) => {
+      const x1 = nodes[a].x, y1 = nodes[a].y;
+      const x2 = nodes[b].x, y2 = nodes[b].y;
+      ctx.moveTo(x1, y1);
+      ctx.quadraticCurveTo(
+        (x1 + x2) / 2 - (y2 - y1) * 0.1,
+        (y1 + y2) / 2 + (x2 - x1) * 0.1,
+        x2, y2);
+    };
+    ctx.lineWidth = 0.75 / k;
+    ctx.strokeStyle = focus ? '#bac1c9' : '#334155';
+    ctx.beginPath();
     for (const l of links) {
-      const active = focus && (l.source.i === hover.i || l.target.i === hover.i);
-      ctx.strokeStyle = active ? 'rgba(57,135,229,0.85)' : 'rgba(255,255,255,0.07)';
-      ctx.beginPath();
-      ctx.moveTo(l.source.x, l.source.y);
-      ctx.lineTo(l.target.x, l.target.y);
-      ctx.stroke();
+      if (focus && l.source !== hover.i && l.target !== hover.i) continue;
+      curve(l.source, l.target);
     }
+    ctx.stroke();
+
+    // ノード: 外周10%が白 #f2f2f2 のボーダー + 界隈色（VRCXのnode-border構成）。
+    // ホバー中: 本人=黄色×1.6 / 隣人=×1.2 / それ以外はほぼ消す
     for (const n of nodes) {
-      const t = TRUST[n.trust];
-      const dimmed = (focus && !focus.has(n.i)) || (highlight && !highlight.has(n.i));
-      ctx.globalAlpha = dimmed ? 0.16 : 1;
+      let r = radius(n);
+      if (focus && !focus.has(n.i)) {
+        ctx.fillStyle = 'rgba(148,163,184,0.06)';
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, Math.max(0.7 / k, r * 0.4), 0, 2 * Math.PI);
+        ctx.fill();
+        continue;
+      }
+      if (focus) r *= n.i === hover.i ? 1.6 : 1.2;
+      const dimmed = highlight && !highlight.has(n.i);
+      ctx.globalAlpha = dimmed ? 0.12 : 1;
       ctx.beginPath();
-      ctx.arc(n.x, n.y, radius(n), 0, 2 * Math.PI);
-      ctx.fillStyle = t ? t.color : '#898781';
+      ctx.arc(n.x, n.y, r, 0, 2 * Math.PI);
+      ctx.fillStyle = '#f2f2f2';
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r * 0.9, 0, 2 * Math.PI);
+      ctx.fillStyle = focus && n.i === hover.i ? '#facc15' : n.color;
       ctx.fill();
       if (n.fav && !dimmed) {
         ctx.strokeStyle = '#eda100';
-        ctx.lineWidth = 1.4 / transform.k;
+        ctx.lineWidth = 1.5 / k;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r + 1.5 / k, 0, 2 * Math.PI);
         ctx.stroke();
       }
-      if ((hover && n.i === hover.i) || (highlight && highlight.has(n.i))) {
+      if (highlight && highlight.has(n.i)) {
         ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1.5 / transform.k;
+        ctx.lineWidth = 1.5 / k;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r + 1.5 / k, 0, 2 * Math.PI);
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
     }
-    const showAll = transform.k > 2.2;
-    ctx.font = `${11 / transform.k}px system-ui, sans-serif`;
+
+    // ラベル: 画面上の直径が閾値を超えるノードにdeg順で表示、重なりは間引く
+    // （VRCXのlabelRenderedSizeThreshold=10と同じ考え方）。
+    // ホバー中は本人「名前 (N)」と隣人だけに切り替え
+    ctx.font = `${12 / k}px system-ui, sans-serif`;
     ctx.textAlign = 'center';
-    for (const n of nodes) {
-      const show = showAll || (hover && (n.i === hover.i || (focus && focus.has(n.i) && transform.k > 1.2)))
-        || (highlight && highlight.has(n.i));
-      if (!show) continue;
-      if (highlight && !highlight.has(n.i) && !(hover && n.i === hover.i)) continue;
-      ctx.fillStyle = '#c3c2b7';
-      ctx.fillText(n.name, n.x, n.y - radius(n) - 3 / transform.k);
+    ctx.lineWidth = 3 / k;
+    ctx.strokeStyle = 'rgba(10,11,13,0.7)';
+    ctx.fillStyle = '#e2e8f0';
+    const placed = [];
+    const label = (n, text, scale, force) => {
+      const sx = n.x * k + transform.x;
+      const sy = n.y * k + transform.y;
+      if (sx < -60 || sx > W + 60 || sy < -30 || sy > H + 30) return;
+      const y = n.y - radius(n) * scale - 5 / k;
+      const w = ctx.measureText(text).width;
+      const h = 14 / k;
+      const box = [n.x - w / 2, y - h, n.x + w / 2, y];
+      if (!force) {
+        for (const b of placed) {
+          if (box[0] < b[2] && box[2] > b[0] && box[1] < b[3] && box[3] > b[1]) return;
+        }
+      }
+      placed.push(box);
+      ctx.strokeText(text, n.x, y);
+      ctx.fillText(text, n.x, y);
+    };
+    if (focus) {
+      label(hover, `${hover.name} (${hover.deg})`, 1.6, true);
+      for (const i of focus) {
+        if (i !== hover.i) label(nodes[i], nodes[i].name, 1.2, false);
+      }
+    } else {
+      for (const n of labelOrder) {
+        const hit = highlight && highlight.has(n.i);
+        if (highlight && !hit) continue;
+        // Sigmaと同じくズームの平方根で見かけサイズを計算して閾値判定
+        if (!hit && radius(n) * Math.sqrt(k) < 8) continue;
+        label(n, n.name, 1, false);
+      }
     }
     ctx.restore();
   };
-  sim.on('tick', draw);
+
+  // 初期表示は全体がちょうど収まる倍率にフィット
+  const fit = () => {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const n of nodes) {
+      const r = radius(n);
+      x0 = Math.min(x0, n.x - r); x1 = Math.max(x1, n.x + r);
+      y0 = Math.min(y0, n.y - r); y1 = Math.max(y1, n.y + r);
+    }
+    const k = Math.min(2.5, (W - 90) / (x1 - x0), (H - 70) / (y1 - y0));
+    return d3.zoomIdentity
+      .translate(W / 2 - k * (x0 + x1) / 2, H / 2 - k * (y0 + y1) / 2)
+      .scale(k);
+  };
+
   onResize(() => {
     W = wrap.clientWidth;
     H = Math.max(420, Math.min(innerHeight - 230, 760));
@@ -1213,33 +1437,26 @@ async function pageGraph() {
     return transform.invert([e.clientX - r.left, e.clientY - r.top]);
   };
 
-  d3.select(canvas)
-    .call(d3.drag()
-      .container(canvas)
-      .subject((e) => {
-        const [x, y] = pt(e.sourceEvent || e);
-        return sim.find(x, y, 12 / transform.k);
-      })
-      .on('start', (e) => { if (!e.active) sim.alphaTarget(0.25).restart(); e.subject.fx = e.subject.x; e.subject.fy = e.subject.y; })
-      .on('drag', (e) => {
-        const [x, y] = pt(e.sourceEvent);
-        e.subject.fx = x; e.subject.fy = y;
-      })
-      .on('end', (e) => { if (!e.active) sim.alphaTarget(0); e.subject.fx = null; e.subject.fy = null; }))
-    .call(d3.zoom()
-      .scaleExtent([0.25, 8])
-      .filter((e) => {
-        if (e.type === 'mousedown' || e.type === 'touchstart') {
-          const src = e.touches ? e.touches[0] : e;
-          return !sim.find(...pt(src), 12 / transform.k);
-        }
-        return true;
-      })
-      .on('zoom', (e) => { transform = e.transform; draw(); }));
+  const findNode = (x, y, slack) => {
+    let best = null;
+    let bestD = Infinity;
+    for (const n of nodes) {
+      const dx = x - n.x, dy = y - n.y;
+      const d2 = dx * dx + dy * dy;
+      const r = radius(n) + slack;
+      if (d2 < r * r && d2 < bestD) { bestD = d2; best = n; }
+    }
+    return best;
+  };
+
+  const zoomer = d3.zoom()
+    .scaleExtent([0.2, 8])
+    .on('zoom', (e) => { transform = e.transform; draw(); });
+  d3.select(canvas).call(zoomer).call(zoomer.transform, fit());
 
   canvas.addEventListener('mousemove', (e) => {
     const [x, y] = pt(e);
-    const n = sim.find(x, y, 14 / transform.k);
+    const n = findNode(x, y, 6 / transform.k);
     if (n !== hover) { hover = n || null; draw(); }
     if (hover) {
       const t = TRUST[hover.trust];
@@ -1251,13 +1468,15 @@ async function pageGraph() {
   });
   canvas.addEventListener('mouseleave', () => { hover = null; hideTooltip(); draw(); });
   canvas.addEventListener('click', (e) => {
-    const n = sim.find(...pt(e), 12 / transform.k);
+    const n = findNode(...pt(e), 6 / transform.k);
     if (n) location.hash = '#/user/' + n.id;
   });
 
   $('#g-q').addEventListener('input', (e) => {
     const q = e.target.value.trim().toLowerCase();
-    highlight = q ? new Set(nodes.filter(n => n.name.toLowerCase().includes(q)).map(n => n.i)) : null;
+    highlight = q
+      ? new Set(nodes.filter(n => n.name.toLowerCase().includes(q)).map(n => n.i))
+      : null;
     if (highlight && !highlight.size) highlight = null;
     draw();
   });
